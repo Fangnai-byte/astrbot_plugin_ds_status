@@ -75,5 +75,16 @@
     "description": "推送时附带条目链接",
     "type": "bool",
     "default": true
+  },
+  "use_forward": {
+    "description": "用合并转发推送",
+    "type": "bool",
+    "default": true,
+    "hint": "把本轮条目打包成一条合并转发消息，避免刷屏。平台不支持时会自动回落到普通文本。"
+  },
+  "forward_name": {
+    "description": "合并转发显示的昵称",
+    "type": "string",
+    "default": "DS 状态订阅"
   }
 }

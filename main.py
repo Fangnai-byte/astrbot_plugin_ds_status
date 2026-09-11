@@ -371,14 +371,54 @@ class DsStatusPlugin(Star):
             lines.append(entry["link"])
         return "\n".join(lines)
 
-    async def push_to_subscribers(self, text: str) -> tuple[int, int]:
-        ok = 0
-        fail = 0
-        for umo in list(self.store.subscribers):
+    def format_entries(self, entries: list[dict[str, str]]) -> str:
+        return "\n\n".join(self.format_entry(e) for e in entries)
+
+    def use_forward(self) -> bool:
+        return _as_bool(_cfg(self.config, "use_forward", True), True)
+
+    def forward_name(self) -> str:
+        return str(_cfg(self.config, "forward_name", "DS 状态订阅") or "DS 状态订阅").strip()
+
+    def forward_nodes(self, entries: list[dict[str, str]], info: str = "") -> Any:
+        """把多条条目打包成一个合并转发节点集合。"""
+        name = self.forward_name()
+        nodes = []
+        if info:
+            nodes.append(Comp.Node(content=[Comp.Plain(text=info)], name=name, uin="0"))
+        for entry in entries:
+            nodes.append(
+                Comp.Node(
+                    content=[Comp.Plain(text=self.format_entry(entry))],
+                    name=name,
+                    uin="0",
+                )
+            )
+        return Comp.Nodes(nodes=nodes)
+
+    async def _send_entries(self, umo: str, entries: list[dict[str, str]]) -> bool:
+        if self.use_forward():
             try:
                 sent = await self.context.send_message(
-                    umo, MessageChain([Comp.Plain(text=text)])
+                    umo, MessageChain([self.forward_nodes(entries)])
                 )
+                if sent:
+                    return True
+                logger.warning(f"[{PLUGIN_NAME}] 合并转发未送达，回落到普通文本：{umo}")
+            except Exception as exc:
+                logger.warning(f"[{PLUGIN_NAME}] 合并转发失败（{exc}），回落到普通文本：{umo}")
+        return await self.context.send_message(
+            umo, MessageChain([Comp.Plain(text=self.format_entries(entries))])
+        )
+
+    async def push_to_subscribers(self, entries: list[dict[str, str]]) -> tuple[int, int]:
+        ok = 0
+        fail = 0
+        if not entries:
+            return 0, 0
+        for umo in list(self.store.subscribers):
+            try:
+                sent = await self._send_entries(umo, entries)
                 if sent:
                     ok += 1
                 else:
@@ -409,12 +449,13 @@ class DsStatusPlugin(Star):
 
             to_push = [e for e in fresh if self._match(e)] if push else []
             pushed = failed = 0
-            for entry in to_push[:limit]:
-                text = self.format_entry(entry)
-                ok, fail = await self.push_to_subscribers(text)
+            send_list = to_push[:limit]
+            if send_list:
+                ok, fail = await self.push_to_subscribers(send_list)
                 pushed += ok
                 failed += fail
-                logger.info(f"[{PLUGIN_NAME}] 新条目已推送：{entry['title']}")
+                for entry in send_list:
+                    logger.info(f"[{PLUGIN_NAME}] 新条目已推送：{entry['title']}")
 
             for entry in fresh:
                 self.store.mark_seen(entry["id"])
@@ -536,8 +577,11 @@ class DsStatusPlugin(Star):
             if entry.get("link"):
                 block += f"\n{entry['link']}"
             blocks.append(block)
-        info = f"来源：{self.rss_url}\n上次检查：{self.store.last_check or '尚未检查'}\n\n"
-        yield event.plain_result(info + "\n\n".join(blocks))
+        info = f"来源：{self.rss_url}\n上次检查：{self.store.last_check or '尚未检查'}"
+        if self.use_forward():
+            yield event.chain_result([self.forward_nodes(head, info=info)])
+            return
+        yield event.plain_result(f"{info}\n\n" + "\n\n".join(blocks))
 
     @filter.command("ds检查")
     async def cmd_check(self, event: AstrMessageEvent):
@@ -570,13 +614,18 @@ class DsStatusPlugin(Star):
         if deny:
             yield event.plain_result(deny)
             return
-        text = "【状态更新】这是一条测试推送\n时间：" + datetime.now(CN_TZ).strftime(
-            "%Y-%m-%d %H:%M"
-        )
-        text += "\n看到这条说明推送链路是通的。"
-        sent = await self.context.send_message(
-            event.unified_msg_origin, MessageChain([Comp.Plain(text=text)])
-        )
+        entry = {
+            "id": "test",
+            "title": "这是一条测试推送",
+            "updated": datetime.now(CN_TZ).strftime("%Y-%m-%d %H:%M"),
+            "summary": "看到这条说明推送链路是通的。",
+            "link": "",
+        }
+        try:
+            sent = await self._send_entries(event.unified_msg_origin, [entry])
+        except Exception as exc:
+            yield event.plain_result(f"推送异常：{exc}")
+            return
         if sent:
             yield event.plain_result("测试消息已推送，去上面看看收到没。")
         else:
@@ -591,6 +640,7 @@ class DsStatusPlugin(Star):
             f"轮询间隔：{self.interval} 秒",
             f"订阅会话数：{len(self.store.subscribers)}",
             f"上次检查：{self.store.last_check or '尚未检查'}",
+            f"推送方式：{'合并转发' if self.use_forward() else '普通文本'}",
             "",
             "/ds订阅 订阅当前会话",
             "/ds退订 取消订阅",

@@ -1,5 +1,7 @@
 # DS Status (状态页订阅)
 
+![logo](logo.png)
+
 订阅 DeepSeek 状态页的 RSS，定时拉取，有新条目就推送到你指定的会话。
 
 - 作者：Fangnai-byte

@@ -14,6 +14,8 @@ help: |
   首次加载不会刷旧消息，只推之后出现的新条目。
 
 # (可选) 插件 Logo 文件名（对应插件目录下的 logo.png）
+# 使用 GitHub 绝对链接，避免 Cloud 构建时资源不同步
+logo: "https://raw.githubusercontent.com/Fangnai-byte/astrbot_plugin_ds_status/main/logo.png"
 
 # (可选) 你的 GitHub 仓库地址
 repo: "https://github.com/Fangnai-byte/astrbot_plugin_ds_status"
