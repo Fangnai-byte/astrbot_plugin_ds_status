@@ -1,0 +1,36 @@
+# 插件的唯一标识名 (不要改)
+name: astrbot_plugin_ds_status
+
+# 插件展示名
+display_name: DS Status (状态页订阅)
+
+# 插件的一句话简介
+desc: 订阅 DeepSeek 状态页 RSS，定时拉取并在有新条目时推送到指定会话，支持多会话订阅、关键词过滤、静默首次同步与管理命令权限控制
+
+# 插件的详细帮助信息
+help: |
+  默认订阅 https://status.deepseek.com/feed.rss，可在配置里换成任意 RSS/Atom 地址。
+  /ds订阅 让当前会话开始接收推送，/ds状态 随时查看最新条目，/ds检查 立即轮询一次。
+  首次加载不会刷旧消息，只推之后出现的新条目。
+
+# (可选) 插件 Logo 文件名（对应插件目录下的 logo.png）
+
+# (可选) 你的 GitHub 仓库地址
+repo: "https://github.com/Fangnai-byte/astrbot_plugin_ds_status"
+
+# 插件版本号
+version: 0.1.0
+
+# 作者名
+author: Fangnai-byte
+
+# 声明支持的平台
+support_platforms:
+  - aiocqhttp
+  - telegram
+  - discord
+  - lark
+  - wecom
+
+# 声明支持的 AstrBot 版本范围
+astrbot_version: ">=v4.12.0"

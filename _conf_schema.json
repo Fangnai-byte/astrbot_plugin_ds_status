@@ -1,0 +1,79 @@
+{
+  "enabled": {
+    "description": "总开关：启用自动轮询与推送",
+    "type": "bool",
+    "default": true
+  },
+  "rss_url": {
+    "description": "RSS 订阅地址",
+    "type": "string",
+    "default": "https://status.deepseek.com/feed.rss",
+    "hint": "默认订阅 DeepSeek 状态页。换成别的 RSS/Atom 地址也能用。"
+  },
+  "poll_interval_sec": {
+    "description": "轮询间隔（秒）",
+    "type": "int",
+    "default": 600,
+    "hint": "建议不低于 300 秒，避免频繁请求被限流。"
+  },
+  "timeout_sec": {
+    "description": "单次请求超时（秒）",
+    "type": "int",
+    "default": 20
+  },
+  "proxy": {
+    "description": "可选 HTTP 代理",
+    "type": "string",
+    "default": "",
+    "hint": "例如 http://127.0.0.1:7890，留空表示直连。"
+  },
+  "user_agent": {
+    "description": "请求使用的 User-Agent",
+    "type": "string",
+    "default": "Mozilla/5.0 (AstrBot DsStatus)"
+  },
+  "allow_user_ids": {
+    "description": "允许使用命令的 QQ 号（留空=所有人）",
+    "type": "list",
+    "default": [],
+    "hint": "只控制谁能敲命令，不影响推送；订阅管理命令还受下面的管理员开关限制。"
+  },
+  "admin_only": {
+    "description": "订阅管理命令仅管理员可用",
+    "type": "bool",
+    "default": true,
+    "hint": "关闭后白名单用户也能订阅、退订和强制检查。"
+  },
+  "initial_sync": {
+    "description": "首次运行推送已有条目",
+    "type": "bool",
+    "default": false,
+    "hint": "关闭时首次运行只静默记录，避免刚装好就刷一屏旧消息。"
+  },
+  "push_max_entries": {
+    "description": "单次轮询最多推送的新条目数",
+    "type": "int",
+    "default": 3
+  },
+  "filter_keywords": {
+    "description": "只推送包含这些关键词的条目",
+    "type": "list",
+    "default": [],
+    "hint": "留空表示全部推送。"
+  },
+  "ignore_keywords": {
+    "description": "跳过包含这些关键词的条目",
+    "type": "list",
+    "default": []
+  },
+  "max_content_chars": {
+    "description": "正文摘要最大字数",
+    "type": "int",
+    "default": 300
+  },
+  "include_link": {
+    "description": "推送时附带条目链接",
+    "type": "bool",
+    "default": true
+  }
+}
