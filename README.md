@@ -6,7 +6,7 @@
 
 - 作者：Fangnai-byte
 - 版本：0.1.0
-- 仓库：https://github.com/Fangnai-byte/astrbot_plugin_ds_status
+- 仓库：https://github.com/NekoHome-Studio/astrbot_plugin_ds_status
 - 支持平台：aiocqhttp 等 AstrBot 官方平台适配器
 
 ## 它做什么
