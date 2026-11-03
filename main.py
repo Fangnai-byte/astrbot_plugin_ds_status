@@ -8,6 +8,9 @@
     /ds退订         取消当前会话的订阅
     /ds订阅列表     查看已订阅的会话
     /ds状态         立即拉取并查看最新条目（只读，不推送）
+    /ds状态 rss     只看状态页
+    /ds状态 mail    只看邮箱（需开启 mail_enabled）
+    /ds状态 all     两个都看，同一条会合并
     /ds检查         立即轮询一次，有新条目就推送
     /ds测试         往当前会话推送一条测试消息
     /ds帮助         查看命令说明
@@ -958,17 +961,52 @@ class DsStatusPlugin(Star):
         lines.extend(f"{i}. {umo}" for i, umo in enumerate(self.store.subscribers, 1))
         yield event.plain_result("\n".join(lines))
 
+    @staticmethod
+    def normalize_mode(value: str | None) -> str:
+        """把用户写的来源名归一成 rss / mail / all，认不出来就当 rss。"""
+        aliases = {
+            "rss": "rss", "订阅": "rss", "源": "rss", "状态页": "rss",
+            "mail": "mail", "email": "mail", "邮件": "mail", "邮箱": "mail",
+            "all": "all", "全部": "all", "都看": "all",
+        }
+        return aliases.get((value or "").strip().lower(), "rss")
+
+    async def _status_entries(self, mode: str) -> tuple[list[dict[str, str]], str]:
+        """按模式取条目，返回（条目，来源说明）。"""
+        if mode == "mail":
+            if not self.mail_enabled:
+                raise RuntimeError("邮箱源没开（配置里 mail_enabled）")
+            entries = await self.fetch_mail()
+            return entries, "邮箱"
+        if mode == "all":
+            entries = await self.fetch_feed()
+            if self.mail_enabled:
+                try:
+                    mail = await self.fetch_mail()
+                except Exception as exc:
+                    logger.warning(f"[{PLUGIN_NAME}] 看全部时邮箱拉取失败：{exc}")
+                    mail = []
+                ids = {e["id"] for e in mail}
+                entries = mail + [e for e in entries if e["id"] not in ids]
+            return entries, "状态页 + 邮箱"
+        entries = await self.fetch_feed()
+        return entries, self.rss_url
+
     @filter.command("ds状态")
-    async def cmd_status(self, event: AstrMessageEvent):
-        """查看最新状态条目"""
+    async def cmd_status(self, event: AstrMessageEvent, mode: str = "rss"):
+        """查看最新状态条目，可指定来源：rss / mail / all"""
         deny = self._deny_text(event)
         if deny:
             yield event.plain_result(deny)
             return
+        mode = self.normalize_mode(mode)
         try:
-            entries = await self.fetch_feed()
+            entries, source = await self._status_entries(mode)
         except Exception as exc:
             yield event.plain_result(f"拉取失败：{exc}")
+            return
+        if not entries:
+            yield event.plain_result(f"{source} 里暂时没有条目。")
             return
         head = entries[:3]
         max_chars = max(50, _as_int(_cfg(self.config, "max_content_chars", 300), 300))
@@ -983,7 +1021,7 @@ class DsStatusPlugin(Star):
             if entry.get("link"):
                 block += f"\n{entry['link']}"
             blocks.append(block)
-        info = f"来源：{self.rss_url}\n上次检查：{self.store.last_check or '尚未检查'}"
+        info = f"来源：{source}\n上次检查：{self.store.last_check or '尚未检查'}"
         if self.use_forward():
             yield event.chain_result([self.forward_nodes(head, info=info)])
             return
@@ -1052,7 +1090,7 @@ class DsStatusPlugin(Star):
             "/ds订阅 订阅当前会话",
             "/ds退订 取消订阅",
             "/ds订阅列表 查看订阅的会话",
-            "/ds状态 查看最新条目",
+            "/ds状态 查看最新条目（也可以 /ds状态 rss、mail、all）",
             "/ds检查 立即检查并推送新条目",
             "/ds测试 发送一条测试推送",
             "/ds帮助 显示这份说明",
