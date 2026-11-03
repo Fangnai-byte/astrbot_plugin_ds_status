@@ -564,7 +564,11 @@ class DsStatusPlugin(Star):
 
     @property
     def interval(self) -> int:
-        return max(60, _as_int(_cfg(self.config, "poll_interval_sec", 600), 600))
+        rss = max(60, _as_int(_cfg(self.config, "poll_interval_sec", 600), 600))
+        if not self.mail_enabled:
+            return rss
+        # 两个源各自配了间隔，取短的那个，免得邮箱要等 RSS 那一轮
+        return min(rss, self.mail_interval)
 
     def _allowed(self, event: AstrMessageEvent) -> bool:
         ids = [str(x) for x in _as_list(_cfg(self.config, "allow_user_ids", []))]
@@ -599,6 +603,10 @@ class DsStatusPlugin(Star):
             except (asyncio.CancelledError, Exception):
                 pass
             self._task = None
+        client = getattr(self, "_mail_conn", None)
+        if client is not None:
+            client.close()
+            self._mail_conn = None
         self.store.save()
         logger.info(f"[{PLUGIN_NAME}] 已卸载")
 
@@ -718,24 +726,6 @@ class DsStatusPlugin(Star):
             )
         return Comp.Nodes(nodes=nodes)
 
-    def card_markdown(self, entries: list[dict[str, str]]) -> str:
-        """把条目拼成一张卡片的 Markdown。"""
-        max_chars = max(50, _as_int(_cfg(self.config, "max_content_chars", 300), 300))
-        blocks = []
-        for entry in entries:
-            summary = (entry.get("summary") or "").strip()
-            if len(summary) > max_chars:
-                summary = summary[:max_chars].rstrip() + "……"
-            head = f"## {entry.get('title', '（无标题）')}"
-            meta = " · ".join(x for x in (entry.get("source", ""), entry.get("updated", "")) if x)
-            body = [head, meta]
-            if summary:
-                body.append(summary)
-            if _as_bool(_cfg(self.config, "include_link", True), True) and entry.get("link"):
-                body.append(entry["link"])
-            blocks.append("\n\n".join(body))
-        return "\n\n---\n\n".join(blocks)
-
     async def _send_card(self, umo: str, entries: list[dict[str, str]]) -> bool:
         """把条目画成图片发出去。渲染失败不算错，由调用方回落到文本。"""
         path = await asyncio.to_thread(self._render_card_file, entries)
@@ -767,8 +757,21 @@ class DsStatusPlugin(Star):
 
         render = _load()
         stamp = datetime.now(CN_TZ).strftime("%Y%m%d_%H%M%S_%f")
-        out = self.data_dir / "cards" / f"ds_status_{stamp}.png"
-        return render(entries, out)
+        card_dir = self.data_dir / "cards"
+        out = card_dir / f"ds_status_{stamp}.png"
+        path = render(entries, out)
+        self._prune_cards(card_dir)
+        return path
+
+    @staticmethod
+    def _prune_cards(card_dir: Path, keep: int = 40) -> None:
+        """卡片图只留最近 keep 张。每推一次留一个 PNG，不清理会一直涨。"""
+        try:
+            files = sorted(card_dir.glob("ds_status_*.png"), key=lambda p: p.stat().st_mtime)
+            for old in files[:-keep] if len(files) > keep else []:
+                old.unlink(missing_ok=True)
+        except Exception as exc:
+            logger.debug(f"[{PLUGIN_NAME}] 清理旧卡片失败：{exc}")
 
     async def _send_entries(self, umo: str, entries: list[dict[str, str]]) -> bool:
         if self.push_as_image:
@@ -849,7 +852,12 @@ class DsStatusPlugin(Star):
                 for entry in send_list:
                     logger.info(f"[{PLUGIN_NAME}] 新条目已推送：{entry['title']}")
 
+            # 只把「确实处理过」的记成已读：被条数上限截掉的那几条留到下一轮，
+            # 否则一次来 5 条、上限 3，剩下 2 条就永远丢了。
+            dropped = {e["id"] for e in to_push[len(send_list):]}
             for entry in fresh:
+                if entry["id"] in dropped:
+                    continue
                 self.store.mark_seen(entry["id"])
             self.store.last_check = datetime.now(CN_TZ).strftime("%Y-%m-%d %H:%M")
             self.store.last_error = mail_error
@@ -911,6 +919,12 @@ class DsStatusPlugin(Star):
             return
         self.store.subscribers.append(umo)
         self.store.save()
+        # 订阅前没人收的时候插件不轮询，seen 里可能积了一批没推的旧条目；
+        # 先静默对齐一次，只从这条之后的新动态开始推。
+        try:
+            await self.poll_once(push=False)
+        except Exception as exc:
+            logger.warning(f"[{PLUGIN_NAME}] 订阅后对齐失败：{exc}")
         yield event.plain_result(
             f"订阅成功，之后有新动态会推送到这里。当前订阅会话数：{len(self.store.subscribers)}。"
         )
