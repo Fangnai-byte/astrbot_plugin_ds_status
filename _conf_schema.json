@@ -86,5 +86,66 @@
     "description": "合并转发显示的昵称",
     "type": "string",
     "default": "DS 状态订阅"
+  },
+  "push_as_image": {
+    "description": "把推送渲染成图片卡片",
+    "type": "bool",
+    "default": false,
+    "hint": "开启后每次推送是一张图片，正文更长也好看。渲染失败会自动回落到文本。"
+  },
+  "mail_enabled": {
+    "description": "同时监听邮箱通知",
+    "type": "bool",
+    "default": false,
+    "hint": "DeepSeek 的邮件比状态页全（计费预告这类只发邮件），也会早几分钟。"
+  },
+  "mail_imap_host": {
+    "description": "IMAP 服务器",
+    "type": "string",
+    "default": "imap.qq.com"
+  },
+  "mail_imap_port": {
+    "description": "IMAP 端口",
+    "type": "int",
+    "default": 993
+  },
+  "mail_user": {
+    "description": "邮箱账号",
+    "type": "string",
+    "default": "",
+    "hint": "完整地址，例如 123456789@qq.com。"
+  },
+  "mail_auth_code": {
+    "description": "邮箱授权码",
+    "type": "string",
+    "default": "",
+    "hint": "不是登录密码。QQ 邮箱在 设置 → 账户 → POP3/IMAP 服务 里生成。"
+  },
+  "mail_folder": {
+    "description": "监听的邮箱文件夹",
+    "type": "string",
+    "default": "INBOX"
+  },
+  "mail_from_filter": {
+    "description": "只收这个发件人的邮件",
+    "type": "string",
+    "default": "deepseek",
+    "hint": "留空表示不过滤发件人。"
+  },
+  "mail_lookback_days": {
+    "description": "只回看最近几天的邮件",
+    "type": "int",
+    "default": 3
+  },
+  "mail_max_per_check": {
+    "description": "每次最多解析几封邮件",
+    "type": "int",
+    "default": 8
+  },
+  "mail_timeout_sec": {
+    "description": "IMAP 连接超时（秒）",
+    "type": "int",
+    "default": 20,
+    "hint": "QQ 被限流时会不回包，没有超时会一直挂着。"
   }
 }

@@ -16,6 +16,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import html
 import json
 import re
@@ -36,6 +37,7 @@ CN_TZ = ZoneInfo("Asia/Shanghai")
 DEFAULT_RSS_URL = "https://status.deepseek.com/feed.rss"
 PLUGIN_NAME = "astrbot_plugin_ds_status"
 MAX_SEEN = 300
+MAX_MAIL_SEEN = 300
 
 
 # ---------------------------------------------------------------- 工具函数
@@ -157,6 +159,278 @@ def _format_time(raw: str) -> str:
     return parsed.astimezone(CN_TZ).strftime("%Y-%m-%d %H:%M")
 
 
+# ---------------------------------------------------------------- 邮件源
+
+def _decode_mime(value: str) -> str:
+    """解 MIME 编码的头（=?utf-8?B?...?=），失败就原样返回。"""
+    if not value:
+        return ""
+    try:
+        from email.header import decode_header
+
+        out = []
+        for text, enc in decode_header(value):
+            if isinstance(text, bytes):
+                out.append(text.decode(enc or "utf-8", "replace"))
+            else:
+                out.append(text)
+        return "".join(out).strip()
+    except Exception:
+        return value.strip()
+
+
+def _html_to_text(raw: str) -> str:
+    """HTML 转纯文本。
+
+    比 strip_html 多做三步：去掉 <style>/<script>/<head>（不然 CSS 会当正文）、
+    去掉注释、清掉零宽字符（QQ 的邮件里夹着 U+200B 那些）。
+    """
+    text = re.sub(r"(?is)<(style|script|head)[^>]*>.*?</\1>", " ", raw or "")
+    text = re.sub(r"(?s)<!--.*?-->", " ", text)
+    text = re.sub(r"(?is)<br\s*/?>|</p>|</div>|</tr>|</h\d>", "\n", text)
+    text = strip_html(text)
+    text = re.sub(r"[\u200b-\u200f\u202a-\u202e\ufeff\u2060]", "", text)
+    text = re.sub(r"\n{3,}", "\n\n", text)
+    return text.strip()
+
+
+def _mail_body_text(msg) -> str:
+    """取邮件正文：优先 text/plain，没有就把 text/html 去标签。
+
+    DeepSeek 的通知邮件是 HTML + 纯文本双份，纯文本那份最干净。
+    """
+    plain, markup = "", ""
+    for part in msg.walk() if msg.is_multipart() else [msg]:
+        ctype = part.get_content_type()
+        if ctype not in ("text/plain", "text/html"):
+            continue
+        try:
+            payload = part.get_payload(decode=True)
+        except Exception:
+            continue
+        if not payload:
+            continue
+        charset = part.get_content_charset() or "utf-8"
+        try:
+            text = payload.decode(charset, "replace")
+        except Exception:
+            text = payload.decode("utf-8", "replace")
+        if ctype == "text/plain" and not plain:
+            plain = text
+        elif ctype == "text/html" and not markup:
+            markup = text
+    # DeepSeek 的通知邮件只有 HTML 一份，纯文本那半截没什么用
+    if markup and len(strip_html(markup)) >= len(strip_html(plain or "")):
+        return _html_to_text(markup)
+    return strip_html(plain or markup)
+
+
+def _first_url(text: str) -> str:
+    m = re.search(r"https?://[^\s<>\"')]+", text or "")
+    return m.group(0) if m else ""
+
+
+def _link_from_msg(msg) -> str:
+    """邮件里的「查看详情」是 <a href>，去标签后 URL 就没了，得从原始 HTML 取。"""
+    for part in msg.walk() if msg.is_multipart() else [msg]:
+        if part.get_content_type() != "text/html":
+            continue
+        try:
+            raw = part.get_payload(decode=True)
+        except Exception:
+            continue
+        if not raw:
+            continue
+        text = raw.decode(part.get_content_charset() or "utf-8", "replace")
+        m = re.search(r'href="(https?://[^"]*(?:incident|maintenance)[^"]*)"', text, re.I)
+        if m:
+            return m.group(1)
+        m = re.search(r'href="(https?://[^"]+)"', text, re.I)
+        if m and "unsubscribe" not in m.group(1).lower():
+            return m.group(1)
+    return ""
+
+
+def _mail_entries_on_conn(conn, from_filter: str, lookback_days: int, limit: int) -> list[dict[str, str]]:
+    """在已登录的连接上拉一次。抽出来是为了让常驻连接和一次性调用共用同一段逻辑。"""
+    import email
+    from datetime import datetime as _dt, timedelta
+    from email.utils import parsedate_to_datetime
+
+    since = (_dt.now() - timedelta(days=max(1, lookback_days))).strftime("%d-%b-%Y")
+    # 括号只能有一层：早先写成 (FROM "x" (SINCE d)) 这种嵌套，QQ 的 IMAP
+    # 不报错也不回包，只能干等到超时。
+    parts = []
+    if from_filter:
+        parts.append(f'FROM "{from_filter}"')
+    parts.append(f"SINCE {since}")
+    crit = "(" + " ".join(parts) + ")"
+
+    entries: list[dict[str, str]] = []
+    typ, data = conn.search(None, crit)
+    if typ != "OK" or not data or not data[0]:
+        return entries
+    ids = data[0].split()
+    # 只取最近 limit 封：老邮件没必要每轮解析
+    for num in ids[-max(1, limit):]:
+        typ, payload = conn.fetch(num, "(BODY.PEEK[])")
+        if typ != "OK" or not payload or not isinstance(payload[0], tuple):
+            continue
+        msg = email.message_from_bytes(payload[0][1])
+        subject = _decode_mime(msg.get("Subject", ""))
+        body = _mail_body_text(msg)
+        # 邮件正文第一行往往是「故障：<标题>」，跟 title 重复，去掉
+        first_line, _, rest = body.partition("\n")
+        if first_line.strip().startswith(("故障", "维护", "Incident", "Maintenance")) and (
+            subject[:8] in first_line or first_line[:20] in subject
+        ):
+            body = rest.strip() or body
+        raw_date = msg.get("Date", "")
+        try:
+            dt = parsedate_to_datetime(raw_date).astimezone(CN_TZ)
+            updated = dt.strftime("%Y-%m-%d %H:%M")
+            id_time = dt.strftime("%Y%m%d%H%M%S")
+        except Exception:
+            updated = raw_date
+            id_time = raw_date
+        link = _first_url(body) or _link_from_msg(msg)
+        num = incident_number(link, body, msg.get("Message-ID", "") or "")
+        st = status_of(body)
+        base = f"incident:{num}" if num else (
+            (msg.get("Message-ID", "") or "").strip() or f"mail|{subject}|{id_time}"
+        )
+        fp = st or hashlib.sha1(f"{subject}\n{body}".encode("utf-8")).hexdigest()[:8]
+        body = dedupe_lines(body, subject)
+        entries.append(
+            {
+                "id": f"{base}#{fp}",
+                "title": subject or "（无主题）",
+                "link": link,
+                "updated": updated,
+                "summary": body[:1200],
+                "source": "邮件",
+            }
+        )
+    # 同一次故障会连发好几封（监控中→监控中→…），同一 id 只留最新那封
+    latest: dict[str, dict[str, str]] = {}
+    for entry in entries:
+        prev = latest.get(entry["id"])
+        if prev is None or entry["updated"] >= prev["updated"]:
+            latest[entry["id"]] = entry
+    return list(latest.values())
+
+
+class MailClient:
+    """常驻的 IMAP 连接。
+
+    QQ 邮箱在短时间多次登录后会静默不响应（连 search 都拿不到回包），
+    所以这里只登录一次，之后的轮询复用；连接被服务端断掉时自动重连一次。
+    """
+
+    def __init__(self, host: str, port: int, user: str, auth_code: str,
+                 folder: str, timeout: int = 20) -> None:
+        self.host = host
+        self.port = port
+        self.user = user
+        self.auth_code = auth_code
+        self.folder = folder or "INBOX"
+        self.timeout = timeout
+        self._conn = None
+        self._selected = ""
+
+    def _connect(self):
+        import imaplib
+        import ssl
+
+        conn = imaplib.IMAP4_SSL(
+            self.host, self.port,
+            ssl_context=ssl.create_default_context(),
+            timeout=self.timeout,
+        )
+        conn.login(self.user, self.auth_code)
+        self._conn = conn
+        self._selected = ""
+        return conn
+
+    def _ensure(self):
+        if self._conn is None:
+            return self._connect()
+        try:
+            # NOOP 探活：服务端已断开时这里会抛，触发重连
+            self._conn.noop()
+        except Exception:
+            self.close()
+            return self._connect()
+        return self._conn
+
+    def close(self) -> None:
+        conn, self._conn, self._selected = self._conn, None, ""
+        if conn is not None:
+            try:
+                conn.logout()
+            except Exception:
+                pass
+
+    def fetch(self, from_filter: str, lookback_days: int, limit: int) -> list[dict[str, str]]:
+        for attempt in (1, 2):
+            try:
+                conn = self._ensure()
+                if self._selected != self.folder:
+                    conn.select(self.folder, readonly=True)
+                    self._selected = self.folder
+                return _mail_entries_on_conn(conn, from_filter, lookback_days, limit)
+            except Exception:
+                self.close()
+                if attempt == 2:
+                    raise
+        return []
+
+
+# ---------------------------------------------------------------- 事件去重
+
+def incident_number(*texts: str) -> str:
+    """从链接或 guid 里抠事件编号。RSS 的 guid 是 `urn:flashduty:change:7202016104287`，
+    邮件里没有 guid，只能从「查看详情」的链接 /incidents/7202016104287 取。"""
+    for text in texts:
+        if not text:
+            continue
+        for pat in (r"/incidents?/(\d+)", r"change:(\d+)", r"incident[_\- ]?(\d{6,})"):
+            m = re.search(pat, text, re.I)
+            if m:
+                return m.group(1)
+    return ""
+
+
+def status_of(text: str) -> str:
+    """把中英文的状态描述归一成几个值。"""
+    low = (text or "").lower()
+    if "resolved" in low or "已恢复" in low or "已解决" in low:
+        return "resolved"
+    if "monitoring" in low or "监控" in low:
+        return "monitoring"
+    if "identified" in low or "已定位" in low:
+        return "identified"
+    if "investigating" in low or "调查中" in low:
+        return "investigating"
+    if "maintenance" in low or "维护" in low:
+        return "maintenance"
+    return ""
+
+
+def dedupe_lines(text: str, digest: str) -> str:
+    """去掉正文开头跟标题重复的那几行（邮件里固定会重复一遍）。"""
+    lines = [x.strip() for x in (text or "").splitlines()]
+    keep = []
+    for line in lines:
+        if not line:
+            continue
+        if not keep and (line == digest or (digest and (line in digest or digest in line))):
+            continue
+        if not keep and line in ("故障更新", "故障", "维护", "Incident Update", "Maintenance"):
+            continue
+        keep.append(line)
+    return "\n".join(keep)
+
 def parse_feed(xml_text: str) -> list[dict[str, str]]:
     """解析 RSS 2.0 / Atom，返回条目列表。"""
     root = ElementTree.fromstring(xml_text.strip())
@@ -181,9 +455,16 @@ def parse_feed(xml_text: str) -> list[dict[str, str]]:
                 if _local_name(child.tag) == "encoded":
                     summary = strip_html(child.text or "")
                     break
+        # 去重键带内容指纹：同一 guid 的条目会被原站原地改写
+        # （事件从 investigating → resolved，标题不变、正文变了），
+        # 只按 guid 去重的话，后续状态变化全被当成「已推送」吞掉。
+        num = incident_number(guid, link)
+        st = status_of(summary) or status_of(title)
+        base = f"incident:{num}" if num else (guid or link or f"{title}|{published}")
+        fp = st or hashlib.sha1(f"{title}\n{summary}".encode("utf-8")).hexdigest()[:8]
         entries.append(
             {
-                "id": guid or link or f"{title}|{published}",
+                "id": f"{base}#{fp}",
                 "title": title or "（无标题）",
                 "link": link,
                 "updated": _format_time(published),
@@ -270,6 +551,18 @@ class DsStatusPlugin(Star):
         return str(_cfg(self.config, "rss_url", DEFAULT_RSS_URL) or DEFAULT_RSS_URL).strip()
 
     @property
+    def mail_enabled(self) -> bool:
+        return _as_bool(_cfg(self.config, "mail_enabled", False), False)
+
+    @property
+    def push_as_image(self) -> bool:
+        return _as_bool(_cfg(self.config, "push_as_image", False), False)
+
+    @property
+    def mail_interval(self) -> int:
+        return max(60, _as_int(_cfg(self.config, "mail_poll_interval_sec", 300), 300))
+
+    @property
     def interval(self) -> int:
         return max(60, _as_int(_cfg(self.config, "poll_interval_sec", 600), 600))
 
@@ -347,6 +640,35 @@ class DsStatusPlugin(Star):
             raise RuntimeError("解析到 0 条条目，内容可能不是 RSS/Atom（例如被拦截页替换）")
         return entries
 
+    def _mail_client(self) -> "MailClient":
+        """按当前配置取（或新建）常驻 IMAP 连接。配置改了会重建。"""
+        cfg = (
+            str(_cfg(self.config, "mail_imap_host", "imap.qq.com") or "imap.qq.com").strip(),
+            _as_int(_cfg(self.config, "mail_imap_port", 993), 993),
+            str(_cfg(self.config, "mail_user", "") or "").strip(),
+            str(_cfg(self.config, "mail_auth_code", "") or "").strip(),
+            str(_cfg(self.config, "mail_folder", "INBOX") or "INBOX").strip(),
+            max(5, _as_int(_cfg(self.config, "mail_timeout_sec", 20), 20)),
+        )
+        client = getattr(self, "_mail_conn", None)
+        if client is None or client.key != cfg:
+            if client is not None:
+                client.close()
+            client = MailClient(*cfg)
+            client.key = cfg
+            self._mail_conn = client
+        return client
+
+    async def fetch_mail(self) -> list[dict[str, str]]:
+        """拉一次邮箱；error 由调用方统一处理。"""
+        client = self._mail_client()
+        return await asyncio.to_thread(
+            client.fetch,
+            str(_cfg(self.config, "mail_from_filter", "deepseek") or "").strip(),
+            _as_int(_cfg(self.config, "mail_lookback_days", 3), 3),
+            _as_int(_cfg(self.config, "mail_max_per_check", 5), 5),
+        )
+
     def _match(self, entry: dict[str, str]) -> bool:
         haystack = f"{entry.get('title', '')}\n{entry.get('summary', '')}"
         ignore = _as_list(_cfg(self.config, "ignore_keywords", []))
@@ -396,7 +718,66 @@ class DsStatusPlugin(Star):
             )
         return Comp.Nodes(nodes=nodes)
 
+    def card_markdown(self, entries: list[dict[str, str]]) -> str:
+        """把条目拼成一张卡片的 Markdown。"""
+        max_chars = max(50, _as_int(_cfg(self.config, "max_content_chars", 300), 300))
+        blocks = []
+        for entry in entries:
+            summary = (entry.get("summary") or "").strip()
+            if len(summary) > max_chars:
+                summary = summary[:max_chars].rstrip() + "……"
+            head = f"## {entry.get('title', '（无标题）')}"
+            meta = " · ".join(x for x in (entry.get("source", ""), entry.get("updated", "")) if x)
+            body = [head, meta]
+            if summary:
+                body.append(summary)
+            if _as_bool(_cfg(self.config, "include_link", True), True) and entry.get("link"):
+                body.append(entry["link"])
+            blocks.append("\n\n".join(body))
+        return "\n\n---\n\n".join(blocks)
+
+    async def _send_card(self, umo: str, entries: list[dict[str, str]]) -> bool:
+        """把条目画成图片发出去。渲染失败不算错，由调用方回落到文本。"""
+        path = await asyncio.to_thread(self._render_card_file, entries)
+        if not path:
+            return False
+        return await self.context.send_message(
+            umo, MessageChain([Comp.Image.fromFileSystem(path)])
+        )
+
+    def _render_card_file(self, entries: list[dict[str, str]]) -> str:
+        """用插件自带的 Pillow 渲染器出图。
+
+        不用 astrbot 的 text_to_image：那张卡的页眉是它的 logo，
+        而且本机没有浏览器时只能走它的本地模板，样式改不了。
+        """
+        from importlib import util as _import_util
+
+        def _load():
+            try:
+                from .card import render_card  # 正常安装（插件作为包加载）
+
+                return render_card
+            except Exception:
+                path = Path(__file__).resolve().parent / "card.py"
+                spec = _import_util.spec_from_file_location("ds_status_card", path)
+                mod = _import_util.module_from_spec(spec)
+                spec.loader.exec_module(mod)
+                return mod.render_card
+
+        render = _load()
+        stamp = datetime.now(CN_TZ).strftime("%Y%m%d_%H%M%S_%f")
+        out = self.data_dir / "cards" / f"ds_status_{stamp}.png"
+        return render(entries, out)
+
     async def _send_entries(self, umo: str, entries: list[dict[str, str]]) -> bool:
+        if self.push_as_image:
+            try:
+                if await self._send_card(umo, entries):
+                    return True
+                logger.warning(f"[{PLUGIN_NAME}] 卡片渲染没出图，回落到文本：{umo}")
+            except Exception as exc:
+                logger.warning(f"[{PLUGIN_NAME}] 卡片渲染失败（{exc}），回落到文本：{umo}")
         if self.use_forward():
             try:
                 sent = await self.context.send_message(
@@ -433,6 +814,17 @@ class DsStatusPlugin(Star):
         """拉取一次。push=False 时只记录不推送（用于首次静默同步）。"""
         async with self._lock:
             entries = await self.fetch_feed()
+            mail_error = ""
+            if self.mail_enabled:
+                try:
+                    mail_entries = await self.fetch_mail()
+                    if mail_entries:
+                        # 邮件排在前面：它比 RSS 早，也更全；同 id 的以邮件为准
+                        ids = {e["id"] for e in mail_entries}
+                        entries = mail_entries + [e for e in entries if e["id"] not in ids]
+                except Exception as exc:  # 邮箱挂了不该拖累 RSS
+                    mail_error = f"邮箱拉取失败：{exc}"
+                    logger.warning(f"[{PLUGIN_NAME}] {mail_error}")
             fresh = [e for e in entries if self.store.is_new(e["id"])]
             limit = max(1, _as_int(_cfg(self.config, "push_max_entries", 3), 3))
             first_run = not self.store.seen
@@ -460,7 +852,7 @@ class DsStatusPlugin(Star):
             for entry in fresh:
                 self.store.mark_seen(entry["id"])
             self.store.last_check = datetime.now(CN_TZ).strftime("%Y-%m-%d %H:%M")
-            self.store.last_error = ""
+            self.store.last_error = mail_error
             self.store.last_title = entries[0]["title"]
             self.store.save()
             return {
@@ -640,7 +1032,8 @@ class DsStatusPlugin(Star):
             f"轮询间隔：{self.interval} 秒",
             f"订阅会话数：{len(self.store.subscribers)}",
             f"上次检查：{self.store.last_check or '尚未检查'}",
-            f"推送方式：{'合并转发' if self.use_forward() else '普通文本'}",
+            f"推送方式：{'图片卡片' if self.push_as_image else ('合并转发' if self.use_forward() else '普通文本')}",
+            f"邮件源：{'开启' if self.mail_enabled else '关闭'}",
             "",
             "/ds订阅 订阅当前会话",
             "/ds退订 取消订阅",
